@@ -237,7 +237,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::CheckComm(DurationArg { duration }) => {
-            let cnt_checked = dumper.check_comm(Duration::from_secs(duration as u64))?;
+            const SECS_TIME_UNIT: u32 = 3;
+            let cnt_times = duration.div_ceil(SECS_TIME_UNIT);
+            let duration = cnt_times * SECS_TIME_UNIT;
+            let progress = ProgressBar::new(duration as u64);
+            progress.set_style(
+                ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue}")
+                    .unwrap()
+                    .progress_chars("##-"),
+            );
+            let mut cnt_checked = 0;
+            for _ in 0..cnt_times {
+                cnt_checked += dumper.check_comm(Duration::from_secs(SECS_TIME_UNIT as u64))?;
+                progress.inc(SECS_TIME_UNIT as u64);
+            }
             println!("{cnt_checked} characters of echo loopback checked OK");
         }
         Commands::UbootInfo => {

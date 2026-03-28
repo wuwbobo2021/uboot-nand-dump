@@ -29,8 +29,8 @@ impl<S: SerialPort> Dumper<S> {
 
     /// Creates an empty [DumpBuf] to be used with [Self::read_next_page].
     pub fn init_read(&mut self, start_offset: usize, mode: DumpMode) -> Result<DumpBuf, Error> {
-        let info = self.select_nand(self.conf.nand_index())?;
-        if let Some(expected) = self.conf.expected_nand_info.clone()
+        let info = self.select_nand(self.config().nand_index())?;
+        if let Some(expected) = self.config().expected_nand_info.clone()
             && !info.contains(&expected)
         {
             return Err(Error::UnexpectedNandInfo(info));
@@ -72,7 +72,7 @@ impl<S: SerialPort> Dumper<S> {
     /// If the page buffer RAM region is available, does `nand read` and `crc32`;
     /// else, does `Self::dump_page_without_crc_check`.
     fn read_page(&mut self, i_page: usize, mode: DumpMode) -> Result<Page, Error> {
-        let Some(&ram_offset) = self.conf.page_buf_ram_offset.as_ref() else {
+        let Some(&ram_offset) = self.config().page_buf_ram_offset.as_ref() else {
             let page = self.read_page_without_crc_check(i_page, mode)?;
             return Ok(page);
         };
@@ -80,6 +80,7 @@ impl<S: SerialPort> Dumper<S> {
         // NOTE: `nand read.raw` reads a page (with OOB) by default, since:
         // <https://patchwork.ozlabs.org/project/uboot/patch/1316785390-17006-1-git-send-email-marek.vasut@gmail.com>
         let nand_offset = i_page * self.nand_conf().page_size;
+        self.clear_read_buffer()?;
         self.send_cmd(&format!(
             "nand read.raw {:#x} {:#x}\n",
             ram_offset, nand_offset
@@ -89,18 +90,17 @@ impl<S: SerialPort> Dumper<S> {
         let mut page = Page::new(self.nand_conf());
         if mode.has_main() {
             let page_data = page.init_data_buf();
-            self.dump_memory(ram_offset, page_data)?;
+            self.dump_memory_no_pre_intr(ram_offset, page_data)?;
         }
         if mode.has_oob() {
             let page_oob = page.init_oob_buf();
-            self.dump_memory(ram_offset + self.nand_conf().page_size as u64, page_oob)?;
+            self.dump_memory_no_pre_intr(ram_offset + self.nand_conf().page_size as u64, page_oob)?;
         }
 
         if mode.has_main() {
             let crc32 = Self::crc32(page.data().unwrap());
             let uboot_crc32 = self.uboot_crc32(ram_offset, self.nand_conf().page_size)?;
             if uboot_crc32 != crc32 {
-                println!("{:#x}, {:#x}", crc32, uboot_crc32);
                 return Err(Error::UnstableConnection);
             }
         }
@@ -112,7 +112,6 @@ impl<S: SerialPort> Dumper<S> {
                 self.nand_conf().page_oob_size,
             )?;
             if uboot_crc32 != crc32 {
-                println!("{:#x}, {:#x}", crc32, uboot_crc32);
                 return Err(Error::UnstableConnection);
             }
         }
@@ -131,7 +130,7 @@ impl<S: SerialPort> Dumper<S> {
     /// Uses the U-boot `crc32` command.
     fn uboot_crc32(&mut self, address: u64, count: usize) -> Result<u32, Error> {
         // NOTE: returning format of `crc32`: `CRC32 for %08lx ... %08lx ==> %08lx\n`.
-        self.send_cmd(&format!("crc32 {:#x} {:#x}\n", address, count))?;
+        self.send_cmd_no_pre_intr(&format!("crc32 {:#x} {:#x}\n", address, count))?;
         loop {
             let line = self.read_until_header("CRC32")?;
             if line.find(&format!("{address:x}")).is_none()
@@ -185,6 +184,6 @@ impl<S: SerialPort> Dumper<S> {
     }
 
     fn nand_conf(&self) -> &NandConfig {
-        &self.conf.nand_conf
+        &self.config().nand_conf
     }
 }
