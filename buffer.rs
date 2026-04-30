@@ -64,6 +64,22 @@ impl Page {
     pub fn oob_mut(&mut self) -> Option<&mut [u8]> {
         self.oob.as_mut().map(|v| &mut v[..])
     }
+
+    /// Returns `false` if this page buffer contains any non-0xFF data, otherwise returns `true`.
+    /// If it is dumped under `DumpMode::Both` mode, `true` indicates the page is really empty.
+    pub fn is_empty(&self) -> bool {
+        if let Some(data) = self.data()
+            && data.iter().any(|&b| b != 0xFF)
+        {
+            return false;
+        }
+        if let Some(oob) = self.oob()
+            && oob.iter().any(|&b| b != 0xFF)
+        {
+            return false;
+        }
+        true
+    }
 }
 
 /// Stores the dumped NAND data.
@@ -203,14 +219,77 @@ impl DumpBuf {
         self.page_dump_size() * self.pages().len()
     }
 
-    /// Gets available pages.
+    /// Gets available pages, starting from the first dumped page (probably not from address 0x0).
     pub fn pages(&self) -> &[Page] {
         &self.pages
     }
 
-    /// Modifies available pages.
+    /// Modifies available pages, starting from the first dumped page (probably not from address 0x0).
     pub fn pages_mut(&mut self) -> &mut [Page] {
         &mut self.pages
+    }
+
+    /// Returns page-aligned main address ranges in which there are only bytes of 0xFF.
+    /// These pages are really empty if the data is dumped under `DumpMode::Both` mode.
+    pub fn find_empty_ranges(&self) -> Vec<Range<usize>> {
+        let mut ranges = Vec::new();
+        let mut cur_range = self.range().start..self.range().start;
+        for page in self.pages() {
+            if page.is_empty() {
+                // extends the empty range by 1 page
+                cur_range.end += self.nand_config().page_size;
+            } else {
+                if !cur_range.is_empty() {
+                    ranges.push(cur_range.clone());
+                }
+                // current page is not empty, so initialize next range
+                // to be empty range starting from the end of previous range.
+                let next_start = cur_range.end + self.nand_config().page_size;
+                cur_range = next_start..next_start;
+            }
+        }
+        if !cur_range.is_empty() {
+            ranges.push(cur_range);
+        }
+        ranges
+    }
+
+    /// Finds bad block marks by checking the OOB bad block marker byte,
+    /// returns main address ranges of each bad block, along with the overall scanned main address range.
+    /// **NOTE**: scanned range will be cut from the buffer's main address range if it is not block-aligned.
+    /// - `i_page_in_block`: the index of page to be checked in the block, usually 0 (first page).
+    /// - `i_mark_in_oob`: the index of bad block marker byte in the page OOB data.
+    pub fn find_bad_blocks(
+        &self,
+        i_page_in_block: usize,
+        i_mark_in_oob: usize,
+    ) -> Result<(Range<usize>, Vec<Range<usize>>), Error> {
+        if !self.dump_mode().has_oob() {
+            return Ok((0..0, Vec::new()));
+        }
+        let (block_size, page_size) = (self.nand_config().erase_size, self.nand_config().page_size);
+        if i_page_in_block >= block_size / page_size
+            || i_mark_in_oob >= self.nand_config().page_oob_size
+        {
+            return Err(Error::OutOfRange);
+        }
+
+        // main address range to be scanned
+        let scan_start = self.range().start.next_multiple_of(block_size);
+        let scan_end = self.range().end / block_size * block_size;
+
+        let mut bad_blocks = Vec::new();
+        // iterates for start address of each block
+        for block_start in (scan_start..scan_end).step_by(block_size) {
+            let rel_start = block_start - self.range().start; // relative address in dumped range
+            let i_page = rel_start / page_size + i_page_in_block;
+            let page = &self.pages()[i_page];
+            let oob = page.oob().unwrap();
+            if oob[i_mark_in_oob] != 0xFF {
+                bad_blocks.push(block_start..block_start + block_size);
+            }
+        }
+        Ok(((scan_start..scan_end), bad_blocks))
     }
 
     /// Saves the dumped data, interleaving main data and OOB data for each page if both are dumped.
@@ -255,4 +334,69 @@ impl DumpBuf {
         file.sync_all()?;
         Ok(())
     }
+}
+
+#[test]
+fn get_empty_ranges_test() {
+    let conf = NandConfig {
+        page_size: 512,
+        page_oob_size: 16,
+        erase_size: 65536,
+        flash_size: 65536,
+    };
+
+    fn build_raw_buf(short_buf: &[u8]) -> Vec<u8> {
+        let mut raw_buf = vec![0xFF; 16 * short_buf.len()];
+        for (i, &v) in short_buf.into_iter().enumerate() {
+            raw_buf[i * 16 + 6] = v;
+        }
+        raw_buf
+    }
+
+    let mut buf = DumpBuf::build(&conf, DumpMode::OobOnly, 0).unwrap();
+    let raw_buf = build_raw_buf(&[0x30, 0xFF, 0xFF, 0xFF, 0x50, 0xFF, 0x70, 0xFF, 0xFF]);
+    buf.append(&raw_buf).unwrap();
+    assert_eq!(
+        buf.find_empty_ranges(),
+        vec![1 * 512..4 * 512, 5 * 512..6 * 512, 7 * 512..9 * 512]
+    );
+
+    let mut buf = DumpBuf::build(&conf, DumpMode::OobOnly, 512).unwrap();
+    let raw_buf = build_raw_buf(&[0xFF, 0xFF, 0xFF, 0x50, 0xFF, 0x70, 0xFF, 0xFF, 0x30, 0x30]);
+    buf.append(&raw_buf).unwrap();
+    assert_eq!(
+        buf.find_empty_ranges(),
+        vec![1 * 512..4 * 512, 5 * 512..6 * 512, 7 * 512..9 * 512]
+    );
+}
+
+#[test]
+fn find_bad_block_test() {
+    let conf = NandConfig {
+        page_size: 512,
+        page_oob_size: 16,
+        erase_size: 1024,
+        flash_size: 65536,
+    };
+
+    fn build_raw_buf(bad_marks: &[bool]) -> Vec<u8> {
+        let mut raw_buf = vec![0xFF; 16 * bad_marks.len()];
+        for (i, &bad) in bad_marks.into_iter().enumerate() {
+            raw_buf[i * 16 + 5] = if bad { 0x00 } else { 0xFF };
+        }
+        raw_buf
+    }
+
+    let mut buf = DumpBuf::build(&conf, DumpMode::OobOnly, 512).unwrap();
+    let raw_buf = build_raw_buf(&[
+        /* skipped 1 page */ false, false, true, false, false, false, true, false, true, false,
+    ]);
+    buf.append(&raw_buf).unwrap();
+    assert_eq!(
+        buf.find_bad_blocks(1, 5).unwrap(),
+        (
+            2 * 512..10 * 512,
+            vec![2 * 512..4 * 512, 6 * 512..8 * 512, 8 * 512..10 * 512]
+        )
+    );
 }

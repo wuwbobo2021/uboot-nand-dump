@@ -47,6 +47,8 @@ enum Commands {
     UbootInfo,
     /// Read a range of NAND data
     Read(NandRwArgs),
+    /// Check the dumped image for empty regions and marked bad blocks
+    Check(ImgCheckArgs),
     /// Merge main-only and OOB-only dump files
     Merge(MergeArgs),
     /// Split main+OOB interleaved dump file into main-only and OOB-only files
@@ -76,6 +78,26 @@ struct NandRwArgs {
     interleave: bool,
     #[arg(long, help = "save partial record if offset+size < flash size")]
     partial: bool,
+}
+
+#[derive(clap::Args)]
+struct ImgCheckArgs {
+    #[arg(long, help = "specify the interleaved image file")]
+    interleaved: Option<PathBuf>,
+    #[arg(long, help = "specify the main-only image file")]
+    main: Option<PathBuf>,
+    #[arg(long, help = "specify the OOB-only image file")]
+    oob: Option<PathBuf>,
+    #[arg(long, help = "image's start address, it must be page-aligned")]
+    offset: String,
+    #[arg(
+        long,
+        help = "byte offset of bad block mark in page OOB (check NAND datasheet); \
+        \nwon't check for bad blocks if not given"
+    )]
+    bad_mark_oob_off: Option<usize>,
+    #[arg(long, help = "page index in the block for bad mark check, default 0")]
+    bad_mark_page_off: Option<usize>,
 }
 
 #[derive(clap::Args)]
@@ -206,6 +228,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let conf = conf_load(&cli.conf)?;
 
     match cli.command {
+        Commands::Check(ImgCheckArgs {
+            interleaved,
+            main,
+            oob,
+            offset,
+            bad_mark_oob_off,
+            bad_mark_page_off,
+        }) => {
+            let offset: usize = parse_hex_or_dec_value(&offset).expect("Invalid offset");
+            if !offset.is_multiple_of(conf.nand_conf.page_size) {
+                return Err("invalid offset".into());
+            }
+            let buf = match (interleaved, main, oob) {
+                (Some(interleaved), None, None) => {
+                    let mut buf = DumpBuf::build(&conf.nand_conf, DumpMode::Both, offset)?;
+                    buf.append(&std::fs::read(interleaved)?)?;
+                    buf
+                }
+                (None, Some(main), Some(oob)) => {
+                    let mut buf = DumpBuf::build(&conf.nand_conf, DumpMode::MainOnly, offset)?;
+                    buf.append(&std::fs::read(main)?)?;
+                    buf.merge_oobs(&std::fs::read(oob)?)?;
+                    buf
+                }
+                (None, Some(main), None) => {
+                    let mut buf = DumpBuf::build(&conf.nand_conf, DumpMode::MainOnly, offset)?;
+                    buf.append(&std::fs::read(main)?)?;
+                    buf
+                }
+                (None, None, Some(oob)) => {
+                    let mut buf = DumpBuf::build(&conf.nand_conf, DumpMode::OobOnly, offset)?;
+                    buf.append(&std::fs::read(oob)?)?;
+                    buf
+                }
+                (None, None, None) => {
+                    return Err("no image file provided".into());
+                }
+                (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                    return Err(
+                        "interleaved and non-interleaved image pathes provided at the same time"
+                            .into(),
+                    );
+                }
+            };
+
+            let empty_ranges = buf.find_empty_ranges();
+            println!("Address ranges of empty regions:");
+            if empty_ranges.is_empty() {
+                println!("\t(Not found)");
+            }
+            for empty_range in empty_ranges {
+                println!("\t[{:#010x}, {:#010x})", empty_range.start, empty_range.end);
+            }
+
+            if let Some(i_mark_in_oob) = bad_mark_oob_off
+                && buf.dump_mode().has_oob()
+            {
+                let i_page_in_block = bad_mark_page_off.unwrap_or(0);
+                let (scanned_range, bad_blocks) =
+                    buf.find_bad_blocks(i_page_in_block, i_mark_in_oob)?;
+                println!(
+                    "Address ranges of bad blocks scanned in [{:#010x}, {:#010x}):",
+                    scanned_range.start, scanned_range.end
+                );
+                if bad_blocks.is_empty() {
+                    println!("\t(Not found)");
+                }
+                for bad_block in bad_blocks {
+                    println!("\t[{:#010x}, {:#010x})", bad_block.start, bad_block.end);
+                }
+            }
+
+            return Ok(());
+        }
         Commands::Merge(MergeArgs { main, oob, output }) => {
             let mut buf = DumpBuf::build(&conf.nand_conf, DumpMode::MainOnly, 0)?;
             buf.append(&std::fs::read(main)?)?;
