@@ -22,6 +22,8 @@ mod dumper_struct {
         serial: BufReader<S>,
         conf: Config,
         buf_line: String, // temp buffer
+        inited_target_mem_op_base: bool,
+        inited_target_empty_buf: bool,
     }
 
     impl<S: SerialPort> Dumper<S> {
@@ -34,6 +36,8 @@ mod dumper_struct {
                 serial: BufReader::with_capacity(8192, serial),
                 conf,
                 buf_line: String::new(),
+                inited_target_mem_op_base: false,
+                inited_target_empty_buf: false,
             })
         }
 
@@ -79,6 +83,52 @@ mod dumper_struct {
         pub(crate) fn writer(&mut self) -> &mut impl Write {
             self.serial.get_mut()
         }
+
+        /// Ensures the base address of target RAM operations is 0x0.
+        /// NOTE: Do this before cmp, cp, md, mdc, mm, ms, mw, mwc.
+        pub(crate) fn init_target_mem_op_base(&mut self) -> Result<(), Error> {
+            if self.inited_target_mem_op_base {
+                return Ok(());
+            }
+            // <https://elixir.u-boot.org/u-boot/v2011.03/source/common/cmd_mem.c#L471>
+            // <https://elixir.u-boot.org/u-boot/v2026.04/source/cmd/mem.c#L522>
+            self.send_cmd("base 0")?;
+            self.read_until_header("Base Address: 0x00000000", None)?;
+            self.inited_target_mem_op_base = true;
+            Ok(())
+        }
+
+        /// Initializes the extra space in the target RAM region to be filled with 0xFF, used for
+        /// empty page checking. Returns the start offset of this extra RAM space.
+        pub(crate) fn init_target_empty_buf(&mut self) -> Result<u64, Error> {
+            let Some(&ram_offset) = self.config().page_buf_ram_offset.as_ref() else {
+                return Err(Error::InvalidConfig(
+                    "quick blank check is impossible because `page_buf_ram_offset` isn't provided",
+                ));
+            };
+            let empty_buf_ram_offset = ram_offset
+                + self.config().nand_conf.page_size as u64
+                + self.config().nand_conf.page_oob_size as u64;
+            let empty_buf_size = self.config().nand_conf.page_size;
+            if self.inited_target_empty_buf {
+                return Ok(empty_buf_ram_offset);
+            }
+            self.init_target_mem_op_base()?;
+            self.send_cmd(&format!(
+                "mw.b {:#x} 0xff {:#x}",
+                empty_buf_ram_offset, empty_buf_size
+            ))?;
+            let mut read_back = vec![0; empty_buf_size];
+            self.dump_memory(empty_buf_ram_offset, &mut read_back)?;
+            if !read_back.iter().any(|&b| b != 0xFF) {
+                self.inited_target_empty_buf = true;
+                Ok(empty_buf_ram_offset)
+            } else {
+                Err(Error::Io(std::io::Error::other(
+                    "failed to initialize 0xFF-filled region in target RAM",
+                )))
+            }
+        }
     }
 }
 
@@ -123,11 +173,11 @@ impl<S: SerialPort> Dumper<S> {
         for _ in 0..3 {
             self.writer().write_all(&[CHAR_CONTROL_C])?;
             self.writer().flush()?;
-            if self.read_until_header(RESP_INTERRUPT).is_ok() {
+            if self.read_until_header(RESP_INTERRUPT, None).is_ok() {
                 return Ok(());
             }
         }
-        self.read_until_header(RESP_INTERRUPT)?;
+        self.read_until_header(RESP_INTERRUPT, None)?;
         Ok(())
     }
 
@@ -147,7 +197,12 @@ impl<S: SerialPort> Dumper<S> {
     }
 
     /// Read lines until one line that contains the `header` and returns that line.
-    pub(crate) fn read_until_header(&mut self, header: &str) -> Result<String, Error> {
+    /// Returns `Error::Shell` if `err_msg_breaker` is found in a line without `header`.
+    pub(crate) fn read_until_header(
+        &mut self,
+        header: &str,
+        err_msg_breaker: Option<&str>,
+    ) -> Result<String, Error> {
         loop {
             let line = self
                 .read_line()
@@ -161,6 +216,10 @@ impl<S: SerialPort> Dumper<S> {
                 .unwrap_or("");
             if line.contains(header) {
                 return Ok(String::from(line));
+            } else if let Some(err_msg) = err_msg_breaker
+                && line.contains(err_msg)
+            {
+                return Err(Error::Shell(line.to_string()));
             }
         }
     }
@@ -231,7 +290,7 @@ impl<S: SerialPort> Dumper<S> {
             }
             self.writer().write_all(b"\n")?;
             self.writer().flush()?;
-            self.read_until_header(&string_check)
+            self.read_until_header(&string_check, None)
                 .map_err(|_| Error::UnstableConnection)?;
             cnt_checked += CHECK_LEN;
         }
@@ -304,6 +363,7 @@ impl<S: SerialPort> Dumper<S> {
         if out_buf.is_empty() {
             return Ok(());
         }
+        self.init_target_mem_op_base()?;
         self.clear_read_buffer()?;
         self.send_cmd_no_pre_intr(&format!(
             "md.l {:#x} {:#x}",
@@ -311,8 +371,22 @@ impl<S: SerialPort> Dumper<S> {
             out_buf.len().div_ceil(4)
         ))?;
         let mut cnt_read = 0;
+        let mut check_first_line = true;
         while cnt_read < out_buf.len() {
             let line = self.read_line_no_eof()?;
+            if check_first_line {
+                let line_head = line.split_whitespace().nth(0).unwrap();
+                if line_head.contains("md.l") {
+                    continue;
+                }
+                let start_addr = line_head.split(":").nth(0).unwrap();
+                if u64::from_str_radix(start_addr, 16) != Ok(offset) {
+                    return Err(Error::Shell(format!(
+                        "expected start addr not found in `{line}`"
+                    )));
+                }
+                check_first_line = false;
+            }
             for (i, hex) in line.split_whitespace().skip(1).enumerate() {
                 let Ok(val) = u32::from_str_radix(hex, 16) else {
                     break;

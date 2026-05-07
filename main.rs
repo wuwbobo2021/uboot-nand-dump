@@ -17,10 +17,10 @@ const PARTIAL_FILE_SUFFIX: &str = ".partial";
 
 #[derive(clap::Parser)]
 #[command(name = "uboot-nand-dump")]
-#[command(version = "0.1.0")]
+#[command(version = "0.1.3")]
 #[command(
     about = "Dumps NAND flash image via U-Boot serial interface",
-    long_about = "<https://crates.io/crates/uboot-nand-dump/0.1.0>"
+    long_about = "<https://crates.io/crates/uboot-nand-dump/0.1.3>"
 )]
 struct Cli {
     #[arg(help = "specific config for NAND parameters and U-boot operation settings")]
@@ -46,7 +46,7 @@ enum Commands {
     /// Probe some U-Boot info
     UbootInfo,
     /// Read a range of NAND data
-    Read(NandRwArgs),
+    Read(NandReadArgs),
     /// Check the dumped image for empty regions and marked bad blocks
     Check(ImgCheckArgs),
     /// Merge main-only and OOB-only dump files
@@ -62,22 +62,32 @@ struct DurationArg {
 }
 
 #[derive(clap::Args)]
-struct NandRwArgs {
+struct NandReadArgs {
     #[arg(
         long,
         help = "only read OOB (fast), if the main data is read elsewhere; offset/size still refer to the main data"
     )]
     oob_only: bool,
+    #[arg(long, help = "only read main data, excluding OOB")]
+    main_only: bool,
     #[arg(help = "name for the dump file")]
     name: String,
     #[arg(long, help = "it must be page-aligned; defaults to 0")]
     offset: Option<String>,
-    #[arg(long, help = "defaults to the remaining flash size after `offset`")]
+    #[arg(
+        long,
+        help = "defaults to remaining flash size after `offset`; ignored if `previous` is given"
+    )]
     size: Option<String>,
     #[arg(long, help = "interleave main+OOB for each page, like `nanddump`")]
     interleave: bool,
     #[arg(long, help = "save partial record if offset+size < flash size")]
     partial: bool,
+    #[arg(
+        long,
+        help = "quick verify against previous image by CRC, don't save a new image if no difference is found"
+    )]
+    previous: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -116,6 +126,7 @@ struct SplitArgs {
 
 fn conf_input(
     mut serial: impl SerialPort,
+    prep_for_power_on: bool,
 ) -> Result<uboot_nand_dump::Config, Box<dyn std::error::Error>> {
     let mut conf = uboot_nand_dump::Config::default();
 
@@ -123,6 +134,10 @@ fn conf_input(
 
     serial.set_baud_rate(conf.baud_rate())?;
     let mut dumper = Dumper::build(serial, conf.clone())?;
+    if prep_for_power_on {
+        println!("preparing for the device's power on event for 5 secs...");
+        dumper.prep_for_power_on(Duration::from_secs(5))?;
+    }
     let infos = dumper.probe_uboot_info()?;
     print_uboot_info(&infos, false);
     println!("\nPlease determine input parameters with the info printed above.\n");
@@ -140,6 +155,14 @@ Give a start offset of a free target RAM space given to this utility if the targ
 RAM address space is known, the space must be *enough* for 1 NAND page with OOB:\
     ",
     );
+
+    if conf.page_buf_ram_offset.is_some() {
+        conf.fast_empty_check =
+            ask_yes_no("Enable empty page checking? this will double the used RAM region size.");
+        conf.enable_uboot_ecc = ask_yes_no(
+            "Enable U-Boot ECC (use `nand read` instead of `nand read.raw` for good blocks)?",
+        );
+    }
 
     println!("Input a string if it should be found in the response of the `nand device` command:");
     conf.expected_nand_info = input_line().map(|s| s.trim().to_string());
@@ -218,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ask_port_selection()?
         };
         let port = serialport::new(&port_name, 115_200).open_native()?;
-        let conf = conf_input(port)?;
+        let conf = conf_input(port, cli.prep_power_on)?;
         let mut path = cli.conf.clone();
         path.set_extension("json");
         conf_save(&conf, &path)?;
@@ -319,13 +342,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => (),
     }
 
-    let port_name = if let Some(name) = cli.port {
-        name
-    } else {
-        ask_port_selection()?
+    let mut dumper = {
+        let port_name = if let Some(name) = cli.port {
+            name
+        } else {
+            ask_port_selection()?
+        };
+        let port = serialport::new(&port_name, conf.baud_rate()).open_native()?;
+        Dumper::build(port, conf.clone())?
     };
-    let port = serialport::new(&port_name, conf.baud_rate()).open_native()?;
-    let mut dumper = Dumper::build(port, conf.clone())?;
+
     if cli.prep_power_on {
         println!("preparing for the device's power on event for 5 secs...");
         dumper.prep_for_power_on(Duration::from_secs(5))?;
@@ -354,20 +380,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_uboot_info(&infos, true);
         }
         Commands::Read(read_params) => {
+            if read_params.main_only && read_params.oob_only {
+                return Err("`main_only` and `oob_only` enabled at the same time".into());
+            }
+            if read_params.previous.is_some() {
+                if read_params.partial {
+                    return Err("`partial` and `previous` enabled at the same time".into());
+                }
+                if !read_params.main_only && !read_params.oob_only && !read_params.interleave {
+                    return Err(
+                        "`previous` option requires `main-only`, `oob-only` or `interleave` mode"
+                            .into(),
+                    );
+                }
+            }
             if conf.page_buf_ram_offset.is_none() {
                 println!(
                     "*** WARNING ***: `page_buf_ram_offset` is not set, CRC32 check will not be performed."
                 );
+                if read_params.previous.is_some() {
+                    return Err("quick verify is impossible: `page_buf_ram_offset` is not set in config file".into());
+                }
             }
+
             let (info, bad_info) = (dumper.nand_info()?, dumper.nand_bad_info()?);
             println!(
                 "Please check the page size {} and page OOB size {} against the U-boot info below:",
                 conf.nand_conf.page_size, conf.nand_conf.page_oob_size
             );
             println!("{info}\n{bad_info}\n");
+            println!(
+                "enable_uboot_ecc: {:?}; fast_empty_check: {:?}",
+                conf.enable_uboot_ecc(),
+                conf.fast_empty_check()
+            );
 
             let dump_mode = if read_params.oob_only {
                 DumpMode::OobOnly
+            } else if read_params.main_only {
+                DumpMode::MainOnly
             } else {
                 DumpMode::Both
             };
@@ -385,12 +436,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 off_start..off_end
             };
 
+            if let Some(previous_img_path) = read_params.previous {
+                // NOTE: this is verify mode; `read_range.end` is ignored here.
+                let mut buf = DumpBuf::build(&conf.nand_conf, dump_mode, read_range.start)?;
+                buf.append(&std::fs::read(previous_img_path)?)?;
+                println!("Checking for differences, please wait...");
+                let spinner = ProgressBar::new_spinner();
+                spinner.set_style(ProgressStyle::with_template("[{elapsed_precise}]").unwrap());
+                spinner.enable_steady_tick(Duration::from_secs(1));
+                let pages_found = dumper.quick_sync(&mut buf)?; // time-consuming
+                println!("Start addresses of pages where differences are found:");
+                if !pages_found.is_empty() {
+                    for page_offset in pages_found {
+                        println!("\t{:#010x}", page_offset);
+                    }
+                    buf_save(
+                        &buf,
+                        &PathBuf::from(read_params.name),
+                        read_params.interleave,
+                    )?;
+                } else {
+                    println!("\t(Not found)");
+                }
+                spinner.finish();
+                return Ok(());
+            }
+
             let partial_file_path = PathBuf::from(read_params.name.clone() + PARTIAL_FILE_SUFFIX);
             let unfinished_result = buf_load_partial(&partial_file_path).ok().and_then(|res| {
                 if res.nand_config() == &conf.nand_conf
                     && res.range().start == read_range.start
                     && res.dump_mode() == dump_mode
-                    && ask_yes_no("Resume the partial dump? If so, make sure the OS haven't booted since that operation.")
+                    && ask_yes_no("Resume the partial dump? If so, make sure the OS hasn't booted since that operation.")
                         .unwrap_or(false)
                 {
                     Some(res)
@@ -429,6 +506,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 progress.inc(result.page_dump_size() as u64);
                 progress.set_message(HumanBytes(result.data_size() as u64).to_string());
+            }
+
+            if read_error.is_none() {
+                progress.finish();
+            } else {
+                progress.abandon();
             }
 
             if (read_params.partial && read_range.end < conf.nand_conf.flash_size)

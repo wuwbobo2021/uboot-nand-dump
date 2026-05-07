@@ -15,10 +15,19 @@ making NAND dump within U-Boot builds without `usb` and `mmc` (SD) subsystems po
 
 However, the speed of this method is the slowest: about 1.7 KB/s (`nand dump` without CRC check),
 or around 2.3KB/s (`nand read.raw` and `md` with CRC check), under baud rate 115,200.
+The speed should be much faster if the U-Boot shell is available through an USB virtual serial port.
 
 The dump result can be checked by `crc32` command if a start offset of a target RAM space is
 given to this utility. The size of this space must be enough for one NAND page with OOB.
 Note that this is more reliable; it is also faster than reading with `nand dump`.
+
+Empty page checking can be enabled if the target RAM region is given; this doubles the size
+of the used RAM region, speeding up dumping of empty pages.
+
+## Verifying
+
+Quick verifying of a given image is supported; CRC32 values of current page data read from U-Boot
+can be checked against that image, and only the differences need to be dumped for creating a new image.
 
 ## File convertion
 
@@ -30,5 +39,5 @@ is supported here.
 
 One who implements any of these features may become the owner of this crate:
 
-- Support erasing, programming and verifying.
 - Support using `saves` command (if available) to perform faster reads.
+- Support erasing and programming (reconstruction is required).

@@ -214,7 +214,7 @@ impl DumpBuf {
         size
     }
 
-    /// Returns the size of all data currently held by this buffer.
+    /// Returns the size of all data (including OOB) currently held by this buffer.
     pub fn data_size(&self) -> usize {
         self.page_dump_size() * self.pages().len()
     }
@@ -282,8 +282,8 @@ impl DumpBuf {
         // iterates for start address of each block
         for block_start in (scan_start..scan_end).step_by(block_size) {
             let rel_start = block_start - self.range().start; // relative address in dumped range
-            let i_page = rel_start / page_size + i_page_in_block;
-            let page = &self.pages()[i_page];
+            let i_page_rel = rel_start / page_size + i_page_in_block;
+            let page = &self.pages()[i_page_rel];
             let oob = page.oob().unwrap();
             if oob[i_mark_in_oob] != 0xFF {
                 bad_blocks.push(block_start..block_start + block_size);

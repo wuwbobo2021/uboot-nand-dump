@@ -21,6 +21,13 @@ pub struct Config {
     /// Start offset of a target RAM space given to this utility.
     /// The space must be enough for 1 NAND page with OOB.
     pub page_buf_ram_offset: Option<u64>,
+    /// Enables an extra space in the target RAM region to be filled with 0xFF, used for
+    /// empty page checking. Increases the used RAM region size by 1 NAND page without OOB.
+    /// Defaults to `false`; `true` value is invalid if `page_buf_ram_offset` is `None`.
+    pub fast_empty_check: Option<bool>,
+    /// Uses `nand read` instead of `nand read.raw`. Defaults to `false`; `true` value
+    /// is invalid if `page_buf_ram_offset` is `None`, because `nand dump` does raw read.
+    pub enable_uboot_ecc: Option<bool>,
 }
 
 impl Config {
@@ -31,6 +38,18 @@ impl Config {
         }
         if self.conf_version != CONF_VERSION {
             return Err(Error::InvalidConfig("config format version mismatch"));
+        }
+        if self.page_buf_ram_offset.is_none() {
+            if self.fast_empty_check() {
+                return Err(Error::InvalidConfig(
+                    "fast_empty_check without given page_buf_ram_offset",
+                ));
+            }
+            if self.enable_uboot_ecc() {
+                return Err(Error::InvalidConfig(
+                    "enable_uboot_ecc without given page_buf_ram_offset",
+                ));
+            }
         }
         self.nand_conf.check()?;
         if self.baud_rate() < 110 || self.baud_rate() > 2_000_000 {
@@ -48,6 +67,14 @@ impl Config {
     pub fn nand_index(&self) -> u32 {
         self.nand_index.unwrap_or(0)
     }
+
+    pub fn fast_empty_check(&self) -> bool {
+        self.page_buf_ram_offset.is_some() && self.fast_empty_check.unwrap_or(false)
+    }
+
+    pub fn enable_uboot_ecc(&self) -> bool {
+        self.page_buf_ram_offset.is_some() && self.enable_uboot_ecc.unwrap_or(false)
+    }
 }
 
 impl Default for Config {
@@ -62,6 +89,8 @@ impl Default for Config {
             nand_index: None,
             expected_nand_info: None,
             page_buf_ram_offset: None,
+            fast_empty_check: None,
+            enable_uboot_ecc: None,
         }
     }
 }
