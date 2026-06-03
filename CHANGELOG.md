@@ -1,6 +1,10 @@
 
 # Changelog
 
+## 0.1.4
+- Enforces command echoback checking in `read_page_into_ram`. This may introduce compatibility problem,
+  but this is important for ensuring data correctness.
+
 ## 0.1.3
 - (!!!) Ensures the base address of target RAM operations is 0x0. Previous versions of this tool may
   produce incorrect result if this opearation base address is changed before using this tool.

@@ -17,10 +17,10 @@ const PARTIAL_FILE_SUFFIX: &str = ".partial";
 
 #[derive(clap::Parser)]
 #[command(name = "uboot-nand-dump")]
-#[command(version = "0.1.3")]
+#[command(version = "0.1.4")]
 #[command(
     about = "Dumps NAND flash image via U-Boot serial interface",
-    long_about = "<https://crates.io/crates/uboot-nand-dump/0.1.3>"
+    long_about = "<https://crates.io/crates/uboot-nand-dump/0.1.4>"
 )]
 struct Cli {
     #[arg(help = "specific config for NAND parameters and U-boot operation settings")]

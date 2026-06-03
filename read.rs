@@ -181,12 +181,14 @@ impl<S: SerialPort> Dumper<S> {
         if self.config().enable_uboot_ecc() {
             read_raw_needed = false;
             if mode.has_main() {
-                self.send_cmd(&format!(
+                let cmd = format!(
                     "nand read {:#x} {:#x} {:#x}\n",
                     ram_offset,
                     nand_offset,
                     self.nand_conf().page_size
-                ))?;
+                );
+                self.send_cmd(&cmd)?;
+                self.read_until_header(cmd.trim(), None)?;
                 // "Skipping bad block" string can be found in:
                 // <https://elixir.u-boot.org/u-boot/v2011.03/source/drivers/mtd/nand/nand_util.c#L630>
                 // <https://elixir.u-boot.org/u-boot/v2013.04/source/drivers/mtd/nand/nand_util.c#L729>
@@ -203,12 +205,14 @@ impl<S: SerialPort> Dumper<S> {
             }
             if !read_raw_needed && mode.has_oob() {
                 let ram_oob_offset = ram_offset + self.nand_conf().page_size as u64;
-                self.send_cmd(&format!(
+                let cmd = format!(
                     "nand read.oob {:#x} {:#x} {:#x}\n",
                     ram_oob_offset,
                     nand_offset,
                     self.nand_conf().page_oob_size
-                ))?;
+                );
+                self.send_cmd(&cmd)?;
+                self.read_until_header(cmd.trim(), None)?;
                 self.read_until_header("OK", None)?;
             }
         }
@@ -216,10 +220,9 @@ impl<S: SerialPort> Dumper<S> {
         if read_raw_needed {
             // NOTE: `nand read.raw` reads one page with OOB by default, since:
             // <https://patchwork.ozlabs.org/project/uboot/patch/1316785390-17006-1-git-send-email-marek.vasut@gmail.com>
-            self.send_cmd(&format!(
-                "nand read.raw {:#x} {:#x}\n",
-                ram_offset, nand_offset
-            ))?;
+            let cmd = format!("nand read.raw {:#x} {:#x}\n", ram_offset, nand_offset);
+            self.send_cmd(&cmd)?;
+            self.read_until_header(cmd.trim(), None)?;
             self.read_until_header("OK", None)?;
         }
 
